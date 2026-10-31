@@ -1,0 +1,8 @@
+.chromium/
+chromium/
+out/
+.ccache/
+*.log
+*.tmp
+.gradle/
+build/

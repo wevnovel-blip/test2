@@ -1,0 +1,321 @@
+name: Build Chromium (Android ARM64)
+
+# Resumable Chromium build for runners with a 6-hour job limit.
+#  * ccache (restored/saved through the Actions cache) keeps compiled objects between runs.
+#  * The compile step is stopped before the job limit; the cache is saved; the workflow then
+#    dispatches itself again until the target is built (max MAX_ATTEMPTS runs).
+#  * When the target is built, the APK(s) are published as a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build target
+        type: choice
+        default: content_shell_apk
+        options:
+          - content_shell_apk
+          - chrome_public_apk
+          - system_webview_apk
+      chromium_version:
+        description: Chromium version tag, e.g. 156.0.8078.79 (blank = latest Stable Android release)
+        type: string
+        required: false
+        default: ''
+      extra_gn_args:
+        description: Extra GN args appended to args.gn (optional)
+        type: string
+        required: false
+        default: ''
+      auto_continue:
+        description: Re-dispatch automatically when the run stops at the time limit
+        type: boolean
+        default: true
+      attempt:
+        description: Internal continuation counter (leave as 1)
+        type: string
+        default: '1'
+
+concurrency:
+  group: chromium-build-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # publish the release
+  actions: write    # prune old caches, dispatch the continuation run
+
+env:
+  MAX_ATTEMPTS: '15'
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  DEPOT_TOOLS_UPDATE: '0'
+  # ccache settings from Chromium's own ccache notes, plus CI-specific ones: a fresh checkout
+  # changes file mtimes every run, so mtime/ctime must not be part of the hash, and the compiler
+  # (third_party/llvm-build) is compared by content, not timestamp.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}/chromium/src
+  CCACHE_COMPILERCHECK: content
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines,locale
+  CCACHE_CPP2: 'yes'
+  CCACHE_COMPRESS: '1'
+  CCACHE_COMPRESSLEVEL: '6'
+  CCACHE_MAXSIZE: 5G
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(vars.CHROMIUM_RUNNER_JSON || '["ubuntu-24.04"]') }}
+    timeout-minutes: 360
+    steps:
+      - name: Record job start
+        shell: bash
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      # Mounts one big LVM volume (root + /mnt free space) over the workspace. Only on
+      # GitHub-hosted runners; self-hosted runners keep their own disk untouched.
+      - name: Maximize build space
+        if: runner.environment == 'github-hosted' && vars.CHROMIUM_MAXIMIZE_DISK != 'false'
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 10240
+          temp-reserve-mb: 1024
+          swap-size-mb: 4096
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Check free disk and resolve Chromium version
+        shell: bash
+        env:
+          IN_VERSION: ${{ inputs.chromium_version }}
+        run: |
+          set -euo pipefail
+          avail_gb=$(df -PBG "$GITHUB_WORKSPACE" | awk 'NR==2 {gsub("G","",$4); print $4}')
+          echo "Free disk for the build: ${avail_gb} GB; CPU threads: $(nproc); RAM: $(free -g | awk '/Mem:/ {print $2}') GB"
+          if [ "$avail_gb" -lt 85 ]; then
+            echo "::error::Only ${avail_gb} GB free; Chromium needs about 100 GB. Use a larger/self-hosted runner."
+            exit 1
+          fi
+          ver="$IN_VERSION"
+          if [ -z "$ver" ]; then
+            ver=$(curl -fsS --retry 5 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android&num=1' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["version"])')
+          fi
+          if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid Chromium version: '$ver'"
+            exit 1
+          fi
+          echo "CHROMIUM_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "Building Chromium $ver"
+
+      - name: Install tools (ccache, depot_tools)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y ccache python3 pkg-config lsb-release curl git
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-arm64-${{ env.CHROMIUM_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-arm64-${{ env.CHROMIUM_VERSION }}-
+            ccache-arm64-
+
+      - name: Fetch Chromium source (no history)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global advice.detachedHead false
+          mkdir -p "$GITHUB_WORKSPACE/chromium"
+          cd "$GITHUB_WORKSPACE/chromium"
+          cat > .gclient <<'GCLIENT_EOF'
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://chromium.googlesource.com/chromium/src.git",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["android"]
+          GCLIENT_EOF
+          # gclient writes the same file layout `fetch android` would; the heredoc above is dedented by YAML.
+          for attempt in 1 2 3; do
+            if gclient sync --nohooks --no-history -r "src@refs/tags/${CHROMIUM_VERSION}"; then ok=1; break; fi
+            echo "gclient sync failed (attempt $attempt); retrying in 60 s"; sleep 60
+          done
+          [ "${ok:-0}" = 1 ] || { echo "::error::gclient sync failed three times"; exit 1; }
+          git -C src log -1 --format='Checked out %H %s' || true
+
+      - name: Repair package manager state
+        shell: bash
+        run: |
+          set -euo pipefail
+          # install-build-deps.py uses apt-get --just-print before installing.
+          # That dry-run exits immediately if an earlier apt/dpkg transaction was
+          # interrupted, so repair and audit dpkg before running Chromium's helper.
+          sudo dpkg --configure -a
+          sudo apt-get -f install -y
+          sudo apt-get update -y
+          if [ -n "$(sudo dpkg --audit)" ]; then
+            echo "::error::dpkg still reports packages requiring repair:"
+            sudo dpkg --audit
+            exit 1
+          fi
+
+      - name: Install Android build dependencies
+        shell: bash
+        working-directory: ${{ github.workspace }}/chromium/src
+        run: |
+          set -euo pipefail
+          sudo ./build/install-build-deps.sh --android --no-prompt --no-chromeos-fonts --no-arm \
+            || sudo ./build/install-build-deps.sh --android --no-prompt
+
+      - name: Run gclient hooks
+        shell: bash
+        working-directory: ${{ github.workspace }}/chromium/src
+        run: gclient runhooks
+
+      - name: Configure ARM64 release build
+        shell: bash
+        working-directory: ${{ github.workspace }}/chromium/src
+        env:
+          EXTRA_GN_ARGS: ${{ inputs.extra_gn_args }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/Release
+          # Core args are always applied. Optional speed args are dropped automatically if this
+          # Chromium revision no longer declares one of them (GN rejects unknown args).
+          cat > "$RUNNER_TEMP/gn-core.args" <<'GN_CORE_EOF'
+          target_os = "android"
+          target_cpu = "arm64"
+          is_debug = false
+          is_component_build = false
+          is_official_build = false
+          symbol_level = 0
+          dcheck_always_on = false
+          treat_warnings_as_errors = false
+          proprietary_codecs = true
+          ffmpeg_branding = "Chrome"
+          cc_wrapper = "ccache"
+          GN_CORE_EOF
+          cat > "$RUNNER_TEMP/gn-optional.args" <<'GN_OPT_EOF'
+          blink_symbol_level = 0
+          v8_symbol_level = 0
+          android_static_analysis = "off"
+          GN_OPT_EOF
+          if [ -n "$EXTRA_GN_ARGS" ]; then printf '%s\n' "$EXTRA_GN_ARGS" > "$RUNNER_TEMP/gn-extra.args"; else : > "$RUNNER_TEMP/gn-extra.args"; fi
+          cat "$RUNNER_TEMP/gn-core.args" "$RUNNER_TEMP/gn-optional.args" "$RUNNER_TEMP/gn-extra.args" > out/Release/args.gn
+          if ! gn gen out/Release; then
+            echo "::warning::gn gen failed with the optional speed args; retrying with core args only"
+            cat "$RUNNER_TEMP/gn-core.args" "$RUNNER_TEMP/gn-extra.args" > out/Release/args.gn
+            gn gen out/Release
+          fi
+          echo "---- args.gn ----"; cat out/Release/args.gn
+
+      - name: Build (time-boxed so the cache can be saved)
+        id: build
+        shell: bash
+        working-directory: ${{ github.workspace }}/chromium/src
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -uo pipefail
+          limit=21600          # GitHub-hosted job limit in seconds (timeout-minutes: 360)
+          reserve=1500         # kept for cache save (~5 min), release upload and the continuation dispatch
+          elapsed=$(( $(date +%s) - JOB_START ))
+          budget=$(( limit - elapsed - reserve ))
+          echo "Elapsed ${elapsed}s; compile budget ${budget}s"
+          mkdir -p "$CCACHE_DIR"; ccache -z >/dev/null 2>&1 || true
+          if [ "$budget" -lt 600 ]; then
+            echo "state=timeout" >> "$GITHUB_OUTPUT"
+            echo "::warning::Setup used almost the whole job; continuing in a new run."
+            exit 0
+          fi
+          timeout --signal=INT --kill-after=180 "${budget}s" autoninja -C out/Release "$TARGET" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          rc=${PIPESTATUS[0]}
+          echo "autoninja exit code: $rc"
+          case "$rc" in
+            0)       echo "state=done" >> "$GITHUB_OUTPUT" ;;
+            124|137) echo "state=timeout" >> "$GITHUB_OUTPUT"; echo "::notice::Time limit reached; progress is kept in the ccache." ;;
+            *)       echo "state=failed" >> "$GITHUB_OUTPUT"; echo "::error::Build failed (exit $rc). Last log lines:"; tail -n 40 "$RUNNER_TEMP/build.log" ;;
+          esac
+          exit 0
+
+      - name: ccache statistics
+        if: always() && steps.build.outcome != 'skipped'
+        shell: bash
+        run: |
+          { echo '### ccache'; echo '```'; ccache -s 2>&1 || true; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh "$CCACHE_DIR" 2>/dev/null || true
+
+      - name: Save ccache
+        if: always() && steps.build.outcome != 'skipped' && env.CHROMIUM_VERSION != ''
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-arm64-${{ env.CHROMIUM_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Prune older ccache entries (repo cache limit is 10 GB)
+        if: always() && steps.build.outcome != 'skipped'
+        shell: bash
+        continue-on-error: true
+        run: |
+          gh cache list --key ccache-arm64- --limit 100 --json id,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[1:] | .[].id' | xargs -r -n1 gh cache delete
+
+      - name: Publish APK(s) as a GitHub Release
+        if: steps.build.outputs.state == 'done'
+        shell: bash
+        working-directory: ${{ github.workspace }}/chromium/src
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find out/Release/apks -maxdepth 1 -name '*.apk' | sort)
+          [ "${#apks[@]}" -gt 0 ] || { echo "::error::Build reported success but no APK was found in out/Release/apks"; exit 1; }
+          cp out/Release/args.gn "$RUNNER_TEMP/args.gn"
+          tag="chromium-${CHROMIUM_VERSION}-arm64"
+          notes="Chromium ${CHROMIUM_VERSION}, Android arm64, target ${TARGET}. Built by workflow run ${GITHUB_RUN_ID}. Debug-signed test/dev build."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${apks[@]}" "$RUNNER_TEMP/args.gn" --clobber
+          else
+            gh release create "$tag" "${apks[@]}" "$RUNNER_TEMP/args.gn" --target "$GITHUB_SHA" --title "Chromium ${CHROMIUM_VERSION} arm64" --notes "$notes"
+          fi
+          echo "Published: ${apks[*]}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Continue in a new run (resume from the ccache)
+        if: steps.build.outputs.state == 'timeout'
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+          EXTRA: ${{ inputs.extra_gn_args }}
+          AUTO: ${{ inputs.auto_continue }}
+          ATTEMPT: ${{ inputs.attempt }}
+        run: |
+          set -euo pipefail
+          next=$(( ATTEMPT + 1 ))
+          if [ "$AUTO" != "true" ]; then
+            echo "::notice::Auto-continue is off. Re-run the workflow with chromium_version=${CHROMIUM_VERSION} to resume."
+            exit 0
+          fi
+          if [ "$next" -gt "$MAX_ATTEMPTS" ]; then
+            echo "::error::Reached MAX_ATTEMPTS=$MAX_ATTEMPTS without finishing. Use a larger runner."
+            exit 1
+          fi
+          gh workflow run build-chromium.yml \
+            -f target="$TARGET" -f chromium_version="$CHROMIUM_VERSION" -f extra_gn_args="$EXTRA" \
+            -f auto_continue=true -f attempt="$next"
+          echo "Dispatched continuation run $next of $MAX_ATTEMPTS" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the job if the build failed
+        if: steps.build.outputs.state == 'failed'
+        shell: bash
+        run: exit 1

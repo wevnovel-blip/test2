@@ -1,0 +1,30 @@
+name: Chromium runner capacity probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ fromJSON(vars.CHROMIUM_RUNNER_JSON || '["ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Report actual runner capacity
+        shell: bash
+        run: |
+          mkdir -p report
+          {
+            echo "Runner: $(uname -a)"
+            echo "Environment: ${{ runner.environment }}  Arch: ${{ runner.arch }}"
+            echo "CPU threads: $(nproc)"
+            free -h
+            df -hT / /mnt "$GITHUB_WORKSPACE" 2>/dev/null || df -hT
+            echo "Free bytes on /: $(df -PB1 / | awk 'NR==2 {print $4}')"
+            echo "Free bytes on /mnt: $(df -PB1 /mnt 2>/dev/null | awk 'NR==2 {print $4}')"
+            echo "Chromium needs ~100 GB free disk and >=16 GB RAM. The build workflow merges / and /mnt on GitHub-hosted runners to reach it."
+          } | tee report/runner-capacity.txt
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runner-capacity-report
+          path: report/runner-capacity.txt
+          retention-days: 14

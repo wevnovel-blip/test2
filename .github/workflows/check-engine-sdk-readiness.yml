@@ -1,0 +1,22 @@
+name: Check custom Chromium Engine SDK readiness
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  readiness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Explain current implementation boundary
+        shell: bash
+        run: |
+          echo 'This is a readiness check, not a Chromium compilation job.'
+          echo 'A real AAR requires a working custom //content Android embedder, JNI/C++, GN target, Gradle wrapper module, runtime assets and sample host app.'
+          test -f sdk/engine/README.md
+          test -f docs/ARCHITECTURE.md
+          if [ ! -f sdk/engine/BUILD.gn ] || [ ! -f sdk/android-wrapper/build.gradle.kts ] || [ ! -f sdk/engine/build-sdk.sh ]; then
+            echo '::notice::SDK implementation is not ready. Complete docs/EMBEDDER_IMPLEMENTATION_CHECKLIST.md before adding the real build job.'
+            exit 0
+          fi
+          echo 'Required source files exist. A maintainer must review their GN/JNI/runtime-asset integration and then implement the actual compile-and-package job.'
